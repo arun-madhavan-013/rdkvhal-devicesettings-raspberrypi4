@@ -1,0 +1,229 @@
+name: Release Tag
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_number:
+        description: "Release version in strict semantic format X.Y.Z (for example: 4.1.0)"
+        required: true
+        type: string
+      ticket:
+        description: "Required ticket prefix; ':' is auto-appended if missing (example: RDK7RM-35, RDKVREFPLT-5489:)"
+        required: true
+        type: string
+      phase:
+        description: "publish: create release branch/changelog/PRs, finish: complete release after approvals"
+        required: true
+        type: choice
+        default: publish
+        options:
+          - publish
+          - finish
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  statuses: read
+
+concurrency:
+  group: release-tag-global
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Create Release Tag
+    runs-on: ubuntu-latest
+    env:
+      RELNUM: ${{ inputs.release_number }}
+      TICKET: ${{ inputs.ticket }}
+      PHASE: ${{ inputs.phase }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git-flow
+          if ! command -v gh >/dev/null 2>&1; then
+            sudo apt-get install -y gh
+          fi
+          npm install -g auto-changelog@2.5.0
+
+      - name: Preflight diagnostics
+        run: |
+          set -euo pipefail
+          echo "phase=${PHASE} release_number=${RELNUM}"
+          git --version
+          git flow version
+          gh --version | head -n 1
+          node --version
+          npm --version
+          auto-changelog --version
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Validate inputs and sync branches
+        run: |
+          set -euo pipefail
+
+          if ! [[ "${RELNUM}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release_number: '${RELNUM}'. Expected strict semantic version format X.Y.Z (for example: 4.1.0)."
+            exit 1
+          fi
+
+          if ! [[ "${PHASE}" =~ ^(publish|finish)$ ]]; then
+            echo "Invalid phase: '${PHASE}'. Expected 'publish' or 'finish'."
+            exit 1
+          fi
+
+          TICKET_PREFIX="$(echo "${TICKET}" | sed 's/[[:space:]]*$//')"
+          if [ -z "${TICKET_PREFIX}" ]; then
+            echo "Invalid ticket: value is empty after trimming trailing spaces."
+            exit 1
+          fi
+
+          if ! [[ "${TICKET_PREFIX}" =~ :$ ]]; then
+            TICKET_PREFIX="${TICKET_PREFIX}:"
+            echo "Ticket suffix ':' was missing and has been appended automatically."
+          fi
+
+          echo "TICKET_PREFIX=${TICKET_PREFIX}" >> "${GITHUB_ENV}"
+
+          git fetch --tags origin
+          if git ls-remote --exit-code --tags origin "refs/tags/${RELNUM}" >/dev/null 2>&1; then
+            echo "Tag '${RELNUM}' already exists on origin. Choose a new release_number."
+            exit 1
+          fi
+
+          git checkout -B main origin/main
+          git checkout -B develop origin/develop
+
+      - name: Configure git-flow for main/develop
+        run: |
+          git config gitflow.branch.master main
+          git config gitflow.branch.develop develop
+          git config gitflow.prefix.feature feature/
+          git config gitflow.prefix.bugfix bugfix/
+          git config gitflow.prefix.release release/
+          git config gitflow.prefix.hotfix hotfix/
+          git config gitflow.prefix.support support/
+          git config gitflow.prefix.versiontag ""
+
+      - name: Publish release and open PRs
+        if: inputs.phase == 'publish'
+        run: |
+          set -euo pipefail
+
+          RELEASE_BRANCH="release/${RELNUM}"
+          if git show-ref --verify --quiet "refs/heads/${RELEASE_BRANCH}" || \
+             git ls-remote --exit-code --heads origin "${RELEASE_BRANCH}" > /dev/null 2>&1; then
+            echo "ERROR: Release branch '${RELEASE_BRANCH}' already exists locally or on origin."
+            echo "If this is a retry after a transient failure, run phase=finish or delete the branch before re-publishing."
+            exit 1
+          fi
+
+          git flow release start "${RELNUM}"
+          auto-changelog -v "${RELNUM}"
+
+          git add CHANGELOG.md
+          if git diff --cached --quiet; then
+            echo "No changelog changes detected for ${RELNUM}. Aborting release workflow."
+            exit 1
+          fi
+          git commit -s -m "${TICKET_PREFIX} Changelog updates for ${RELNUM}"
+
+          git flow release publish "${RELNUM}"
+
+          if [ "$(gh pr list --base develop --head "${RELEASE_BRANCH}" --state open --json number --jq 'length')" -eq 0 ]; then
+            gh pr create --base develop --head "${RELEASE_BRANCH}" --title "Release ${RELNUM} -> develop" --body "Automated release PR for ${RELNUM}. Do not merge from UI."
+          fi
+
+          if [ "$(gh pr list --base main --head "${RELEASE_BRANCH}" --state open --json number --jq 'length')" -eq 0 ]; then
+            gh pr create --base main --head "${RELEASE_BRANCH}" --title "Release ${RELNUM} -> main" --body "Automated release PR for ${RELNUM}. Do not merge from UI."
+          fi
+
+      - name: Finish published release
+        if: inputs.phase == 'finish'
+        run: |
+          set -euo pipefail
+
+          RELEASE_BRANCH="release/${RELNUM}"
+          if ! FETCH_OUTPUT="$(git fetch origin "${RELEASE_BRANCH}:${RELEASE_BRANCH}" 2>&1)"; then
+            if printf '%s' "${FETCH_OUTPUT}" | grep -qi "couldn't find remote ref"; then
+              echo "Remote branch '${RELEASE_BRANCH}' was not found on origin; checking local branch next."
+            else
+              echo "ERROR: Failed to fetch '${RELEASE_BRANCH}' from origin."
+              printf '%s\n' "${FETCH_OUTPUT}"
+              exit 1
+            fi
+          fi
+
+          if ! git show-ref --verify --quiet "refs/heads/${RELEASE_BRANCH}"; then
+            echo "Release branch '${RELEASE_BRANCH}' does not exist locally or on origin. Run phase=publish first."
+            exit 1
+          fi
+
+          for BASE in develop main; do
+            PR_COUNT="$(gh pr list --base "${BASE}" --head "${RELEASE_BRANCH}" --state open --json number --jq 'length')"
+            if [ "${PR_COUNT}" -eq 0 ]; then
+              echo "Missing open PR from ${RELEASE_BRANCH} to ${BASE}. Ensure publish phase completed and PR is still open."
+              exit 1
+            fi
+            if [ "${PR_COUNT}" -gt 1 ]; then
+              echo "Found ${PR_COUNT} open PRs from ${RELEASE_BRANCH} to ${BASE}. Expected exactly 1 open PR before finish."
+              echo "Close duplicate PRs and re-run finish phase."
+              exit 1
+            fi
+
+            PR_NUMBER="$(gh pr list --base "${BASE}" --head "${RELEASE_BRANCH}" --state open --json number --jq '.[0].number')"
+            PR_HEAD_REF="$(gh pr view "${PR_NUMBER}" --json headRefName --jq '.headRefName // ""')"
+            if [ "${PR_HEAD_REF}" != "${RELEASE_BRANCH}" ]; then
+              echo "PR #${PR_NUMBER} head branch is '${PR_HEAD_REF}', expected '${RELEASE_BRANCH}'."
+              exit 1
+            fi
+
+            REVIEW_DECISION="$(gh pr view "${PR_NUMBER}" --json reviewDecision --jq '.reviewDecision // ""')"
+            if [ "${REVIEW_DECISION}" != "APPROVED" ]; then
+              echo "PR #${PR_NUMBER} (${RELEASE_BRANCH} -> ${BASE}) is not approved. Current reviewDecision=${REVIEW_DECISION}."
+              exit 1
+            fi
+
+            CHECKS_OK="$(gh pr view "${PR_NUMBER}" --json statusCheckRollup --jq 'if (.statusCheckRollup | length) == 0 then false else ([.statusCheckRollup[] | (.conclusion // .state // "UNKNOWN")] | all(. == "SUCCESS" or . == "NEUTRAL" or . == "SKIPPED" or . == "CANCELLED")) end')"
+            if [ "${CHECKS_OK}" != "true" ]; then
+              echo "PR #${PR_NUMBER} (${RELEASE_BRANCH} -> ${BASE}) does not have all status checks passing."
+              exit 1
+            fi
+          done
+
+          git checkout develop
+          git flow release finish -m "Release ${RELNUM}" "${RELNUM}"
+          git push origin develop
+          git push origin main
+          git push origin --tags
+
+          # Cleanup: delete remote release branch to avoid confusion with obsolete branches
+          git push origin --delete "${RELEASE_BRANCH}" || echo "Warning: failed to delete remote branch ${RELEASE_BRANCH}"
+
+          # Cleanup: close any remaining open PRs from the release branch
+          for BASE in develop main; do
+            PR_NUMBERS="$(gh pr list --base "${BASE}" --head "${RELEASE_BRANCH}" --state open --json number --jq '.[].number')"
+            if [ -n "${PR_NUMBERS}" ]; then
+              for PR in ${PR_NUMBERS}; do
+                gh pr close "${PR}" --comment "Closing obsolete release PR after successful finish of ${RELNUM}." || echo "Warning: failed to close PR #${PR}"
+              done
+            fi
+          done
