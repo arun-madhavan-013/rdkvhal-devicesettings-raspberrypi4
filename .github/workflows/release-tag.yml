@@ -19,6 +19,14 @@ on:
         options:
           - publish
           - finish
+      allow_no_checks_in_finish:
+        description: "Optional test override for Step2=finish: allow PRs with zero reported status checks. Default=false."
+        required: true
+        type: choice
+        default: "false"
+        options:
+          - "false"
+          - "true"
 
 permissions:
   contents: write
@@ -38,6 +46,7 @@ jobs:
       RELNUM: ${{ inputs.release_number }}
       TICKET: ${{ inputs.ticket }}
       PHASE: ${{ inputs.phase }}
+      ALLOW_NO_CHECKS: ${{ inputs.allow_no_checks_in_finish }}
       GH_TOKEN: ${{ github.token }}
 
     steps:
@@ -171,6 +180,10 @@ jobs:
             echo ""
             echo "Step1 (publish) has completed."
             echo ""
+            echo "### Inputs"
+            echo "- Release tag: ${RELNUM}"
+            echo "- Ticket: ${TICKET_PREFIX}"
+            echo ""
             echo "### Open PR(s) to develop"
             if [ -n "${DEVELOP_PRS}" ]; then
               echo "${DEVELOP_PRS}"
@@ -244,7 +257,12 @@ jobs:
               echo "PR #${PR_NUMBER} (${RELEASE_BRANCH} -> ${BASE}) does not have all status checks passing."
               CHECK_COUNT="$(gh pr view "${PR_NUMBER}" --json statusCheckRollup --jq '.statusCheckRollup | length')"
               if [ "${CHECK_COUNT}" -eq 0 ]; then
+                if [ "${ALLOW_NO_CHECKS}" = "true" ]; then
+                  echo "No status checks were reported for PR #${PR_NUMBER}, but allow_no_checks_in_finish=true. Proceeding for this run."
+                  continue
+                fi
                 echo "No status checks were reported for PR #${PR_NUMBER}."
+                echo "Re-run with allow_no_checks_in_finish=true only for controlled test environments if needed."
               else
                 BLOCKING_CHECKS="$(gh pr view "${PR_NUMBER}" --json statusCheckRollup --jq '[.statusCheckRollup[]? | {name: (.name // .context // .workflowName // "unknown"), status: (.conclusion // .state // "UNKNOWN")} | select(.status != "SUCCESS" and .status != "NEUTRAL" and .status != "SKIPPED" and .status != "CANCELLED") | "- \(.name): \(.status)"] | join("\n")')"
                 if [ -n "${BLOCKING_CHECKS}" ]; then
