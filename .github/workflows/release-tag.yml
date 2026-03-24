@@ -12,7 +12,7 @@ on:
         required: true
         type: string
       phase:
-        description: "publish: create release branch/changelog/PRs, finish: complete release after approvals"
+        description: "Step1=publish (create release branch/changelog/PRs). Step2=finish (after PR reviews and checks pass, complete release)."
         required: true
         type: choice
         default: publish
@@ -155,6 +155,43 @@ jobs:
           if [ "$(gh pr list --base main --head "${RELEASE_BRANCH}" --state open --json number --jq 'length')" -eq 0 ]; then
             gh pr create --base main --head "${RELEASE_BRANCH}" --title "Release ${RELNUM} -> main" --body "Automated release PR for ${RELNUM}. Do not merge from UI."
           fi
+
+          DEVELOP_PRS="$(gh pr list --base develop --head "${RELEASE_BRANCH}" --state open --json number,url --jq '[.[] | "- #\(.number): \(.url)"] | join("\n")')"
+          MAIN_PRS="$(gh pr list --base main --head "${RELEASE_BRANCH}" --state open --json number,url --jq '[.[] | "- #\(.number): \(.url)"] | join("\n")')"
+
+          echo "Publish phase completed for ${RELNUM}."
+          echo "Action required before Step2=finish:"
+          echo "1) Review/approve release PR(s) to develop and main."
+          echo "2) Ensure required checks are green."
+          echo "3) Re-run this workflow with phase=finish."
+          echo "Note: Do not merge release PRs manually from the UI; Step2=finish performs the release merge."
+
+          {
+            echo "## Release ${RELNUM} - Step1 Completed"
+            echo ""
+            echo "Step1 (publish) has completed."
+            echo ""
+            echo "### Open PR(s) to develop"
+            if [ -n "${DEVELOP_PRS}" ]; then
+              echo "${DEVELOP_PRS}"
+            else
+              echo "- None"
+            fi
+            echo ""
+            echo "### Open PR(s) to main"
+            if [ -n "${MAIN_PRS}" ]; then
+              echo "${MAIN_PRS}"
+            else
+              echo "- None"
+            fi
+            echo ""
+            echo "### Required Next Action"
+            echo "1. Review and approve both release PRs."
+            echo "2. Wait for required checks to pass."
+            echo "3. Re-run this workflow with phase=finish (Step2)."
+            echo ""
+            echo "Do not merge release PRs manually from the UI; Step2=finish performs the release merge."
+          } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Finish published release
         if: inputs.phase == 'finish'
