@@ -242,6 +242,16 @@ jobs:
             CHECKS_OK="$(gh pr view "${PR_NUMBER}" --json statusCheckRollup --jq 'if (.statusCheckRollup | length) == 0 then false else ([.statusCheckRollup[] | (.conclusion // .state // "UNKNOWN")] | all(. == "SUCCESS" or . == "NEUTRAL" or . == "SKIPPED" or . == "CANCELLED")) end')"
             if [ "${CHECKS_OK}" != "true" ]; then
               echo "PR #${PR_NUMBER} (${RELEASE_BRANCH} -> ${BASE}) does not have all status checks passing."
+              CHECK_COUNT="$(gh pr view "${PR_NUMBER}" --json statusCheckRollup --jq '.statusCheckRollup | length')"
+              if [ "${CHECK_COUNT}" -eq 0 ]; then
+                echo "No status checks were reported for PR #${PR_NUMBER}."
+              else
+                BLOCKING_CHECKS="$(gh pr view "${PR_NUMBER}" --json statusCheckRollup --jq '[.statusCheckRollup[]? | {name: (.name // .context // .workflowName // "unknown"), status: (.conclusion // .state // "UNKNOWN")} | select(.status != "SUCCESS" and .status != "NEUTRAL" and .status != "SKIPPED" and .status != "CANCELLED") | "- \(.name): \(.status)"] | join("\n")')"
+                if [ -n "${BLOCKING_CHECKS}" ]; then
+                  echo "Blocking checks:"
+                  printf '%s\n' "${BLOCKING_CHECKS}"
+                fi
+              fi
               exit 1
             fi
           done
