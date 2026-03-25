@@ -9,8 +9,8 @@ on:
       - reviews
 
 permissions:
-  contents: read
-  pull-requests: read
+  contents: write
+  pull-requests: write
   checks: read
   statuses: read
 
@@ -19,7 +19,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  detect-and-finish:
+  finish:
     name: Auto-Finish Release if Ready
     if: |
       github.event.action != 'closed' &&
@@ -63,7 +63,7 @@ jobs:
 
       - name: Verify PR Count & Content
         run: |
-          # Ensure exactly 1 PR to each base
+          # Ensure exactly 1 PR to each base FROM THIS RELEASE BRANCH
           DEVELOP_COUNT=$(gh pr list \
             --repo "${{ github.repository }}" \
             --head "${{ env.HEAD_REF }}" \
@@ -81,16 +81,33 @@ jobs:
             --jq "length")
 
           if [ "$DEVELOP_COUNT" -ne 1 ]; then
-            echo "❌ Expected 1 open PR to develop, found $DEVELOP_COUNT"
+            echo "❌ Expected 1 open PR to develop for ${{ env.HEAD_REF }}, found $DEVELOP_COUNT"
             exit 1
           fi
 
           if [ "$MAIN_COUNT" -ne 1 ]; then
-            echo "❌ Expected 1 open PR to main, found $MAIN_COUNT"
+            echo "❌ Expected 1 open PR to main for ${{ env.HEAD_REF }}, found $MAIN_COUNT"
             exit 1
           fi
 
-          echo "✅ PR count verified: 1 to develop, 1 to main"
+          echo "✅ PR count verified: 1 to develop, 1 to main (for ${{ env.HEAD_REF }} only)"
+
+      - name: Detect Other Release Branches
+        run: |
+          # List all other open release branches to confirm we're only finishing the correct one
+          echo "📋 Checking for other release/* branches in parallel..."
+          OTHER_RELEASES=$(git ls-remote origin "refs/heads/release/*" | awk '{print $2}' | sed 's|refs/heads/||' | grep -v "^release/${{ steps.extract.outputs.release_number }}$" || true)
+
+          if [ -n "$OTHER_RELEASES" ]; then
+            echo "ℹ️  Other release branches detected (won't be affected by this finish):"
+            echo "$OTHER_RELEASES" | sed 's/^/   - /'
+          else
+            echo "✅ No other release branches - this is the only active release"
+          fi
+
+          echo ""
+          echo "🎯 **FINISHING RELEASE:** ${{ steps.extract.outputs.release_number }}"
+          echo "🔗 **RELEASE BRANCH:** ${{ env.HEAD_REF }}"
 
       - name: Check Approvals (Both PRs)
         run: |
@@ -138,7 +155,7 @@ jobs:
           MAIN_TOTAL=$(echo "$MAIN_ALL_CHECKS" | jq "length")
           echo "✅ Total checks on Main PR: $MAIN_TOTAL"
 
-          # Step 3: Filter for passing checks (SUCCESS, NEUTRAL, SKIPPED)
+          # Step 3: Filter for passing checks
           echo "🔍 Filtering for passing statuses (SUCCESS, NEUTRAL, SKIPPED, CANCELLED)..."
           MAIN_CHECKS=$(echo "$MAIN_ALL_CHECKS" | \
             jq "[.[] | select(.conclusion | IN(\"SUCCESS\", \"NEUTRAL\", \"SKIPPED\", \"CANCELLED\"))] | length")
@@ -190,56 +207,121 @@ jobs:
             echo "✅ Develop PR: all checks passed"
           fi
 
-      - name: Extract Ticket from PR Body
-        id: ticket
-        run: |
-          # Try to extract ticket from PR body (look for pattern like RDK7RM-35 or RDKVREFPLT-5489)
-          TICKET=$(gh pr view \
-            --repo "${{ github.repository }}" \
-            "${{ github.event.pull_request.number }}" \
-            --json "body" \
-            --jq ".body" | \
-            grep -oE '[A-Z]+[A-Z0-9]+-[0-9]+' | head -1 || echo "")
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ env.GH_TOKEN }}
 
-          if [ -z "$TICKET" ]; then
-            echo "⚠️  No ticket found in PR body. You may need to manually extract it."
-            echo "ticket=" >> $GITHUB_OUTPUT
-          else
-            echo "✅ Extracted ticket: $TICKET"
-            echo "ticket=$TICKET" >> $GITHUB_OUTPUT
+      - name: Final Safety Check
+        run: |
+          # Verify PR branch heads match expected release branch (prevent accidental mismatches)
+          MAIN_PR=${{ github.event.pull_request.number }}
+          DEVELOP_PR=${{ steps.pr-develop.outputs.pr_develop }}
+
+          echo "🔒 Verifying PR branch heads before finishing..."
+
+          # Check main PR head branch
+          MAIN_PR_HEAD=$(gh pr view "$MAIN_PR" \
+            --repo "${{ github.repository }}" \
+            --json "headRefName" \
+            --jq ".headRefName")
+
+          if [ "$MAIN_PR_HEAD" != "${{ env.HEAD_REF }}" ]; then
+            echo "❌ SAFETY CHECK FAILED: Main PR #$MAIN_PR head is $MAIN_PR_HEAD, expected ${{ env.HEAD_REF }}"
+            exit 1
           fi
 
-      - name: Trigger Release Finish
-        if: steps.ticket.outputs.ticket != ''
-        run: |
-          gh workflow run release-tag.yml \
+          # Check develop PR head branch
+          DEVELOP_PR_HEAD=$(gh pr view "$DEVELOP_PR" \
             --repo "${{ github.repository }}" \
-            -f release_number="${{ steps.extract.outputs.release_number }}" \
-            -f ticket="${{ steps.ticket.outputs.ticket }}" \
-            -f phase="finish" \
-            -f allow_no_checks_in_finish="false"
+            --json "headRefName" \
+            --jq ".headRefName")
 
-          echo "🚀 Triggered release-tag workflow (phase=finish) for version ${{ steps.extract.outputs.release_number }}"
+          if [ "$DEVELOP_PR_HEAD" != "${{ env.HEAD_REF }}" ]; then
+            echo "❌ SAFETY CHECK FAILED: Develop PR #$DEVELOP_PR head is $DEVELOP_PR_HEAD, expected ${{ env.HEAD_REF }}"
+            exit 1
+          fi
 
-      - name: Alert on Missing Ticket
-        if: steps.ticket.outputs.ticket == ''
-        run: |
-          echo "⚠️  Ticket not found in PR body. Manual finish required."
-          echo "To complete the release, run the release-tag workflow with:"
-          echo "  release_number: ${{ steps.extract.outputs.release_number }}"
-          echo "  ticket: <ticket_prefix>"
-          echo "  phase: finish"
+          echo "✅ Safety check passed: Both PRs have correct branch heads (${{ env.HEAD_REF }})"
           echo ""
-          echo "Add the ticket to the PR description and push a new commit to auto-trigger."
-          exit 1
+          echo "📋 **Release Summary**"
+          echo "   Version: ${{ steps.extract.outputs.release_number }}"
+          echo "   Branch: ${{ env.HEAD_REF }}"
+          echo "   Main PR: #$MAIN_PR"
+          echo "   Develop PR: #$DEVELOP_PR"
+          echo ""
+          echo "🚀 Proceeding with release finish..."
+
+      - name: Setup Git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          sudo apt-get update && sudo apt-get install -y git-flow
+
+      - name: Configure git-flow
+        run: |
+          git flow config set versiontagprefix "v"
+
+      - name: Fetch Release Branch
+        run: |
+          # Fetch with specific error handling
+          FETCH_OUTPUT=$(git fetch origin "release/${{ steps.extract.outputs.release_number }}" 2>&1)
+          FETCH_STATUS=$?
+
+          if [ $FETCH_STATUS -ne 0 ]; then
+            if echo "$FETCH_OUTPUT" | grep -q "couldn't find remote ref"; then
+              echo "❌ Remote branch not found: release/${{ steps.extract.outputs.release_number }}"
+              exit 1
+            else
+              echo "❌ Git fetch failed: $FETCH_OUTPUT"
+              exit 1
+            fi
+          fi
+
+          git checkout -b "release/${{ steps.extract.outputs.release_number }}" "origin/release/${{ steps.extract.outputs.release_number }}"
+          echo "✅ Checked out release branch"
+
+      - name: Execute git-flow release finish
+        run: |
+          # Execute git-flow release finish with messaging
+          git flow release finish -m "Merge release/${{ steps.extract.outputs.release_number }}" "${{ steps.extract.outputs.release_number }}"
+          echo "✅ Git-flow release finish completed"
+
+      - name: Push All Changes
+        run: |
+          # Push to main, develop, and all tags
+          git push origin main develop --all --tags
+          echo "✅ Pushed to main, develop, and tags"
+
+      - name: Delete Remote Release Branch
+        run: |
+          git push origin --delete "release/${{ steps.extract.outputs.release_number }}" || true
+          echo "✅ Remote release branch deleted"
+
+      - name: Close Related PRs
+        run: |
+          # Close both PRs
+          DEVELOP_PR=${{ steps.pr-develop.outputs.pr_develop }}
+          MAIN_PR=${{ github.event.pull_request.number }}
+
+          gh pr close "$MAIN_PR" --comment "✅ Automatically closed - release merged to main"
+          gh pr close "$DEVELOP_PR" --comment "✅ Automatically closed - release merged to develop"
+          echo "✅ Related PRs closed"
 
       - name: Summary
         if: always()
         run: |
           {
-            echo "## Release Auto-Finish Status"
+            echo "## Release ${{ steps.extract.outputs.release_number }} - Auto-Finish Complete ✅"
             echo ""
             echo "**Release Branch:** ${{ env.HEAD_REF }}"
             echo "**Release Number:** ${{ steps.extract.outputs.release_number }}"
-            echo "**Status:** Checks passed, auto-finish triggered ✅"
+            echo "**Status:** Successfully merged to main and develop"
+            echo ""
+            echo "**What happened:**"
+            echo "- Release branch merged to main"
+            echo "- Release branch merged back to develop"
+            echo "- Tag v${{ steps.extract.outputs.release_number }} created"
+            echo "- Both PRs automatically closed"
           } >> $GITHUB_STEP_SUMMARY

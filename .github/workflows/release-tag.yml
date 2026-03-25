@@ -1,245 +1,195 @@
-name: Release Finish Auto
+name: Release Tag
 
 on:
-  pull_request:
-    types:
-      - opened
-      - synchronize
-      - review_requested
-      - reviews
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release version in strict semantic format X.Y.Z (for example: 4.1.0)"
+        required: true
+        type: string
+      ticket:
+        description: "Required ticket prefix; ':' is auto-appended if missing (example: RDK7RM-35, RDKVREFPLT-5489:)"
+        required: true
+        type: string
 
 permissions:
-  contents: read
-  pull-requests: read
+  contents: write
+  pull-requests: write
   checks: read
   statuses: read
 
 concurrency:
-  group: release-${{ github.head_ref }}
+  group: release-tag-global
   cancel-in-progress: false
 
 jobs:
-  detect-and-finish:
-    name: Auto-Finish Release if Ready
-    if: |
-      github.event.action != 'closed' &&
-      github.base_ref == 'main' &&
-      startsWith(github.head_ref, 'release/')
+  publish:
+    name: Create Release PRs
     runs-on: ubuntu-latest
     env:
-      HEAD_REF: ${{ github.head_ref }}
+      RELNUM: ${{ inputs.tag }}
+      TICKET: ${{ inputs.ticket }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Extract Release Number
-        id: extract
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node and Tools
         run: |
-          # Extract X.Y.Z from release/X.Y.Z
-          RELNUM="${HEAD_REF#release/}"
+          sudo apt-get update && sudo apt-get install -y git-flow
+          npm install -g auto-changelog
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      - name: Validate Release Number
+        run: |
           if ! [[ $RELNUM =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "❌ Invalid release branch name: $HEAD_REF (expected release/X.Y.Z)"
+            echo "❌ Invalid release number: $RELNUM (expected X.Y.Z format)"
             exit 1
           fi
-          echo "release_number=$RELNUM" >> $GITHUB_OUTPUT
-          echo "✅ Release number: $RELNUM"
+          echo "✅ Release number valid: $RELNUM"
 
-      - name: Find Related PR to develop
+      - name: Validate Ticket Prefix
+        run: |
+          TICKET_PREFIX="${TICKET%:}"
+          if ! [[ $TICKET_PREFIX =~ ^[A-Z]+[A-Z0-9]*-[0-9]+$ ]]; then
+            echo "❌ Invalid ticket format: $TICKET_PREFIX"
+            echo "Expected format: PROJECT-123 or PROJ-999"
+            exit 1
+          fi
+          TICKET_WITH_COLON="${TICKET_PREFIX}:"
+          echo "✅ Ticket validated: $TICKET_WITH_COLON"
+
+      - name: Check Tag Doesn't Exist
+        id: tag-check
+        run: |
+          if git show-ref --verify --quiet "refs/tags/$RELNUM" || \
+             git ls-remote --exit-code --heads origin "release/$RELNUM" >/dev/null 2>&1; then
+            echo "❌ Release branch/tag already exists for version $RELNUM"
+            exit 1
+          fi
+          echo "✅ No existing release branch for version $RELNUM"
+
+      - name: Configure git-flow
+        run: |
+          git flow config set versiontagprefix "v"
+
+      - name: Create Release Branch
+        run: |
+          git flow release start "$RELNUM"
+          echo "✅ Created release branch: release/$RELNUM"
+
+      - name: Generate CHANGELOG
+        run: |
+          auto-changelog --package --release-count 0 --stdout > /tmp/new_changelog.md
+          head -20 /tmp/new_changelog.md
+          cat /tmp/new_changelog.md > CHANGELOG.md
+          git add CHANGELOG.md
+          git commit -m "chore: update CHANGELOG for release $RELNUM"
+          echo "✅ CHANGELOG updated and committed"
+
+      - name: Create PR to develop
         id: pr-develop
         run: |
-          # Query for PR with same head branch, base=develop
-          PR_NUM=$(gh pr list \
+          PR_NUM=$(gh pr create \
             --repo "${{ github.repository }}" \
-            --head "${{ env.HEAD_REF }}" \
+            --head "release/$RELNUM" \
             --base "develop" \
-            --state "open" \
+            --title "Release $RELNUM → develop" \
+            --body "Merge release/$RELNUM back to develop after approval.
+
+**Ticket:** ${TICKET%:}
+
+This PR was auto-created by the Release Tag workflow." \
             --json "number" \
-            --jq ".[0].number" 2>/dev/null || echo "")
+            --jq ".number" 2>/dev/null || echo "")
 
           if [ -z "$PR_NUM" ] || [ "$PR_NUM" == "null" ]; then
-            echo "❌ No open PR found from ${{ env.HEAD_REF }} to develop"
-            exit 1
+            # PR might already exist, try to fetch it
+            PR_NUM=$(gh pr list \
+              --repo "${{ github.repository }}" \
+              --head "release/$RELNUM" \
+              --base "develop" \
+              --state "open" \
+              --json "number" \
+              --jq ".[0].number" 2>/dev/null || echo "")
+
+            if [ -z "$PR_NUM" ] || [ "$PR_NUM" == "null" ]; then
+              echo "❌ Could not create or find PR to develop"
+              exit 1
+            fi
+            echo "ℹ️ PR to develop already exists: #$PR_NUM"
+          else
+            echo "✅ Created PR to develop: #$PR_NUM"
           fi
           echo "pr_develop=$PR_NUM" >> $GITHUB_OUTPUT
-          echo "✅ PR to develop: #$PR_NUM"
 
-      - name: Verify PR Count & Content
+      - name: Create PR to main
+        id: pr-main
         run: |
-          # Ensure exactly 1 PR to each base
-          DEVELOP_COUNT=$(gh pr list \
+          PR_NUM=$(gh pr create \
             --repo "${{ github.repository }}" \
-            --head "${{ env.HEAD_REF }}" \
-            --base "develop" \
-            --state "open" \
-            --json "number" \
-            --jq "length")
-
-          MAIN_COUNT=$(gh pr list \
-            --repo "${{ github.repository }}" \
-            --head "${{ env.HEAD_REF }}" \
+            --head "release/$RELNUM" \
             --base "main" \
-            --state "open" \
+            --title "Release $RELNUM → main" \
+            --body "Merge release/$RELNUM to main for production release.
+
+**Ticket:** ${TICKET%:}
+**Release Tag:** $RELNUM
+
+This PR was auto-created by the Release Tag workflow.
+
+**Next Steps:**
+1. Review the changes in this PR
+2. Approve this PR and the PR to develop
+3. Status checks must pass on both PRs
+4. Once approved and checks pass, the release will automatically finish and merge" \
             --json "number" \
-            --jq "length")
+            --jq ".number" 2>/dev/null || echo "")
 
-          if [ "$DEVELOP_COUNT" -ne 1 ]; then
-            echo "❌ Expected 1 open PR to develop, found $DEVELOP_COUNT"
-            exit 1
-          fi
+          if [ -z "$PR_NUM" ] || [ "$PR_NUM" == "null" ]; then
+            # PR might already exist, try to fetch it
+            PR_NUM=$(gh pr list \
+              --repo "${{ github.repository }}" \
+              --head "release/$RELNUM" \
+              --base "main" \
+              --state "open" \
+              --json "number" \
+              --jq ".[0].number" 2>/dev/null || echo "")
 
-          if [ "$MAIN_COUNT" -ne 1 ]; then
-            echo "❌ Expected 1 open PR to main, found $MAIN_COUNT"
-            exit 1
-          fi
-
-          echo "✅ PR count verified: 1 to develop, 1 to main"
-
-      - name: Check Approvals (Both PRs)
-        run: |
-          # Check approval on main PR (current context)
-          MAIN_APPROVED=$(gh pr view \
-            --repo "${{ github.repository }}" \
-            "${{ github.event.pull_request.number }}" \
-            --json "reviewDecision" \
-            --jq ".reviewDecision")
-          echo "Main PR review decision: $MAIN_APPROVED"
-          if [ "$MAIN_APPROVED" != "APPROVED" ]; then
-            echo "❌ Main PR (#${{ github.event.pull_request.number }}) not approved. Status: $MAIN_APPROVED"
-            exit 1
-          fi
-
-          # Check approval on develop PR
-          DEVELOP_PR=${{ steps.pr-develop.outputs.pr_develop }}
-          DEVELOP_APPROVED=$(gh pr view \
-            --repo "${{ github.repository }}" \
-            "$DEVELOP_PR" \
-            --json "reviewDecision" \
-            --jq ".reviewDecision")
-          echo "Develop PR review decision: $DEVELOP_APPROVED"
-          if [ "$DEVELOP_APPROVED" != "APPROVED" ]; then
-            echo "❌ Develop PR (#$DEVELOP_PR) not approved. Status: $DEVELOP_APPROVED"
-            exit 1
-          fi
-
-          echo "✅ Both PRs approved"
-
-      - name: Check Status Checks (Both PRs)
-        id: check-status
-        run: |
-          # Main PR checks - Step 1: Get all checks
-          echo "📋 Fetching all checks for Main PR #${{ github.event.pull_request.number }}..."
-          MAIN_ALL_CHECKS=$(gh pr checks \
-            --repo "${{ github.repository }}" \
-            "${{ github.event.pull_request.number }}" \
-            --json "conclusion")
-
-          echo "🔍 Raw output (all checks):"
-          echo "$MAIN_ALL_CHECKS" | jq '.'
-
-          # Step 2: Count total checks
-          MAIN_TOTAL=$(echo "$MAIN_ALL_CHECKS" | jq "length")
-          echo "✅ Total checks on Main PR: $MAIN_TOTAL"
-
-          # Step 3: Filter for passing checks (SUCCESS, NEUTRAL, SKIPPED)
-          echo "🔍 Filtering for passing statuses (SUCCESS, NEUTRAL, SKIPPED, CANCELLED)..."
-          MAIN_CHECKS=$(echo "$MAIN_ALL_CHECKS" | \
-            jq "[.[] | select(.conclusion | IN(\"SUCCESS\", \"NEUTRAL\", \"SKIPPED\", \"CANCELLED\"))] | length")
-          echo "✅ Passing checks on Main PR: $MAIN_CHECKS"
-
-          if [ "$MAIN_TOTAL" -eq 0 ]; then
-            echo "⚠️  Main PR has 0 status checks (expected for forks)"
-          elif [ "$MAIN_CHECKS" -ne "$MAIN_TOTAL" ]; then
-            echo "❌ Main PR: not all checks passed"
-            echo "🔍 Failed/Missing checks details:"
-            echo "$MAIN_ALL_CHECKS" | jq '.[] | select(.conclusion | IN("FAILURE", "TIMED_OUT", "ACTION_REQUIRED"))'
-            gh pr checks --repo "${{ github.repository }}" "${{ github.event.pull_request.number }}"
-            exit 1
+            if [ -z "$PR_NUM" ] || [ "$PR_NUM" == "null" ]; then
+              echo "❌ Could not create or find PR to main"
+              exit 1
+            fi
+            echo "ℹ️ PR to main already exists: #$PR_NUM"
           else
-            echo "✅ Main PR: all checks passed"
+            echo "✅ Created PR to main: #$PR_NUM"
           fi
+          echo "pr_main=$PR_NUM" >> $GITHUB_OUTPUT
 
-          # Develop PR checks - Step 1: Get all checks
-          DEVELOP_PR=${{ steps.pr-develop.outputs.pr_develop }}
-          echo ""
-          echo "📋 Fetching all checks for Develop PR #$DEVELOP_PR..."
-          DEVELOP_ALL_CHECKS=$(gh pr checks \
-            --repo "${{ github.repository }}" \
-            "$DEVELOP_PR" \
-            --json "conclusion")
-
-          echo "🔍 Raw output (all checks):"
-          echo "$DEVELOP_ALL_CHECKS" | jq '.'
-
-          # Step 2: Count total checks
-          DEVELOP_TOTAL=$(echo "$DEVELOP_ALL_CHECKS" | jq "length")
-          echo "✅ Total checks on Develop PR: $DEVELOP_TOTAL"
-
-          # Step 3: Filter for passing checks
-          echo "🔍 Filtering for passing statuses (SUCCESS, NEUTRAL, SKIPPED, CANCELLED)..."
-          DEVELOP_CHECKS=$(echo "$DEVELOP_ALL_CHECKS" | \
-            jq "[.[] | select(.conclusion | IN(\"SUCCESS\", \"NEUTRAL\", \"SKIPPED\", \"CANCELLED\"))] | length")
-          echo "✅ Passing checks on Develop PR: $DEVELOP_CHECKS"
-
-          if [ "$DEVELOP_TOTAL" -eq 0 ]; then
-            echo "⚠️  Develop PR has 0 status checks (expected for forks)"
-          elif [ "$DEVELOP_CHECKS" -ne "$DEVELOP_TOTAL" ]; then
-            echo "❌ Develop PR: not all checks passed"
-            echo "🔍 Failed/Missing checks details:"
-            echo "$DEVELOP_ALL_CHECKS" | jq '.[] | select(.conclusion | IN("FAILURE", "TIMED_OUT", "ACTION_REQUIRED"))'
-            gh pr checks --repo "${{ github.repository }}" "$DEVELOP_PR"
-            exit 1
-          else
-            echo "✅ Develop PR: all checks passed"
-          fi
-
-      - name: Extract Ticket from PR Body
-        id: ticket
-        run: |
-          # Try to extract ticket from PR body (look for pattern like RDK7RM-35 or RDKVREFPLT-5489)
-          TICKET=$(gh pr view \
-            --repo "${{ github.repository }}" \
-            "${{ github.event.pull_request.number }}" \
-            --json "body" \
-            --jq ".body" | \
-            grep -oE '[A-Z]+[A-Z0-9]+-[0-9]+' | head -1 || echo "")
-
-          if [ -z "$TICKET" ]; then
-            echo "⚠️  No ticket found in PR body. You may need to manually extract it."
-            echo "ticket=" >> $GITHUB_OUTPUT
-          else
-            echo "✅ Extracted ticket: $TICKET"
-            echo "ticket=$TICKET" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Trigger Release Finish
-        if: steps.ticket.outputs.ticket != ''
-        run: |
-          gh workflow run release-tag.yml \
-            --repo "${{ github.repository }}" \
-            -f release_number="${{ steps.extract.outputs.release_number }}" \
-            -f ticket="${{ steps.ticket.outputs.ticket }}" \
-            -f phase="finish" \
-            -f allow_no_checks_in_finish="false"
-
-          echo "🚀 Triggered release-tag workflow (phase=finish) for version ${{ steps.extract.outputs.release_number }}"
-
-      - name: Alert on Missing Ticket
-        if: steps.ticket.outputs.ticket == ''
-        run: |
-          echo "⚠️  Ticket not found in PR body. Manual finish required."
-          echo "To complete the release, run the release-tag workflow with:"
-          echo "  release_number: ${{ steps.extract.outputs.release_number }}"
-          echo "  ticket: <ticket_prefix>"
-          echo "  phase: finish"
-          echo ""
-          echo "Add the ticket to the PR description and push a new commit to auto-trigger."
-          exit 1
-
-      - name: Summary
-        if: always()
+      - name: Job Summary
         run: |
           {
-            echo "## Release Auto-Finish Status"
+            echo "#### Release $RELNUM - Step1 Completed"
             echo ""
-            echo "**Release Branch:** ${{ env.HEAD_REF }}"
-            echo "**Release Number:** ${{ steps.extract.outputs.release_number }}"
-            echo "**Status:** Checks passed, auto-finish triggered ✅"
+            echo "**Inputs**"
+            echo "- Release tag: $RELNUM"
+            echo "- Ticket: ${TICKET%:}"
+            echo ""
+            echo "**Open PR(s) to develop**"
+            echo "- [PR #${{ steps.pr-develop.outputs.pr_develop }}](https://github.com/${{ github.repository }}/pull/${{ steps.pr-develop.outputs.pr_develop }})"
+            echo ""
+            echo "**Open PR(s) to main**"
+            echo "- [PR #${{ steps.pr-main.outputs.pr_main }}](https://github.com/${{ github.repository }}/pull/${{ steps.pr-main.outputs.pr_main }})"
+            echo ""
+            echo "**Required Next Action**"
+            echo "1. Review both PRs above"
+            echo "2. Approve both PRs in GitHub"
+            echo "3. Ensure status checks pass on both PRs"
+            echo "4. Once all checks pass, the release will automatically finish and merge"
           } >> $GITHUB_STEP_SUMMARY
