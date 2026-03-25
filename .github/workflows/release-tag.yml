@@ -1,12 +1,32 @@
-name: Release Finish Auto
+name: Release Tag
 
 on:
-  pull_request:
-    types:
-      - opened
-      - synchronize
-      - review_requested
-      - reviews
+  workflow_dispatch:
+    inputs:
+      release_number:
+        description: "Release version in strict semantic format X.Y.Z (for example: 4.1.0)"
+        required: true
+        type: string
+      ticket:
+        description: "Required ticket prefix; ':' is auto-appended if missing (example: RDK7RM-35, RDKVREFPLT-5489:)"
+        required: true
+        type: string
+      phase:
+        description: "Step1=publish (create release branch/changelog/PRs). Step2=finish (after PR reviews and checks pass, complete release)."
+        required: true
+        type: choice
+        default: publish
+        options:
+          - publish
+          - finish
+      allow_no_checks_in_finish:
+        description: "Optional test override for Step2=finish: allow PRs with zero reported status checks. Default=false."
+        required: true
+        type: choice
+        default: "false"
+        options:
+          - "false"
+          - "true"
 
 permissions:
   contents: read
