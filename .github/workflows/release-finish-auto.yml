@@ -57,13 +57,15 @@ jobs:
           MAIN_COUNT=$(gh pr list --base main --head "${HEAD_REF}" --state open --json number --jq 'length')
 
           if [ "${DEVELOP_COUNT}" -ne 1 ]; then
-            echo "Expected exactly 1 open PR to develop for ${HEAD_REF}, found ${DEVELOP_COUNT}."
-            exit 1
+            echo "::notice title=Waiting::Expected 1 open PR to develop for ${HEAD_REF}, found ${DEVELOP_COUNT}."
+            echo "should_finish=false" >> "${GITHUB_OUTPUT}"
+            exit 0
           fi
 
           if [ "${MAIN_COUNT}" -ne 1 ]; then
-            echo "Expected exactly 1 open PR to main for ${HEAD_REF}, found ${MAIN_COUNT}."
-            exit 1
+            echo "::notice title=Waiting::Expected 1 open PR to main for ${HEAD_REF}, found ${MAIN_COUNT}."
+            echo "should_finish=false" >> "${GITHUB_OUTPUT}"
+            exit 0
           fi
 
           DEVELOP_PR=$(gh pr list --base develop --head "${HEAD_REF}" --state open --json number --jq '.[0].number')
@@ -71,24 +73,33 @@ jobs:
 
           echo "develop_pr=${DEVELOP_PR}" >> "${GITHUB_OUTPUT}"
           echo "main_pr=${MAIN_PR}" >> "${GITHUB_OUTPUT}"
+          echo "should_finish=true" >> "${GITHUB_OUTPUT}"
 
       - name: Ensure both PRs are approved
+        id: approvals
+        if: steps.prcheck.outputs.should_finish == 'true'
         run: |
           set -euo pipefail
           MAIN_APPROVAL=$(gh pr view "${{ steps.prcheck.outputs.main_pr }}" --json reviewDecision --jq '.reviewDecision')
           DEV_APPROVAL=$(gh pr view "${{ steps.prcheck.outputs.develop_pr }}" --json reviewDecision --jq '.reviewDecision')
 
           if [ "${MAIN_APPROVAL}" != "APPROVED" ]; then
-            echo "Main PR #${{ steps.prcheck.outputs.main_pr }} is not approved (${MAIN_APPROVAL})."
-            exit 1
+            echo "::notice title=Waiting::Main PR #${{ steps.prcheck.outputs.main_pr }} is not approved (${MAIN_APPROVAL})."
+            echo "should_finish=false" >> "${GITHUB_OUTPUT}"
+            exit 0
           fi
 
           if [ "${DEV_APPROVAL}" != "APPROVED" ]; then
-            echo "Develop PR #${{ steps.prcheck.outputs.develop_pr }} is not approved (${DEV_APPROVAL})."
-            exit 1
+            echo "::notice title=Waiting::Develop PR #${{ steps.prcheck.outputs.develop_pr }} is not approved (${DEV_APPROVAL})."
+            echo "should_finish=false" >> "${GITHUB_OUTPUT}"
+            exit 0
           fi
 
+          echo "should_finish=true" >> "${GITHUB_OUTPUT}"
+
       - name: Ensure checks passed on both PRs
+        id: checks
+        if: steps.approvals.outputs.should_finish == 'true'
         run: |
           set -euo pipefail
 
@@ -105,7 +116,7 @@ jobs:
 
             passing=$(gh pr checks "${pr_number}" --json conclusion --jq '[.[] | select(.conclusion | IN("SUCCESS","NEUTRAL","SKIPPED","CANCELLED"))] | length')
             if [ "${passing}" -ne "${total}" ]; then
-              echo "PR #${pr_number} has failing/pending checks."
+              echo "::notice title=Waiting::PR #${pr_number} has failing/pending checks."
               gh pr checks "${pr_number}"
               return 1
             fi
@@ -113,16 +124,27 @@ jobs:
             return 0
           }
 
-          check_pr "${{ steps.prcheck.outputs.main_pr }}"
-          check_pr "${{ steps.prcheck.outputs.develop_pr }}"
+          if ! check_pr "${{ steps.prcheck.outputs.main_pr }}"; then
+            echo "should_finish=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if ! check_pr "${{ steps.prcheck.outputs.develop_pr }}"; then
+            echo "should_finish=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "should_finish=true" >> "${GITHUB_OUTPUT}"
 
       - name: Checkout repository
+        if: steps.checks.outputs.should_finish == 'true'
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
           token: ${{ env.GH_TOKEN }}
 
       - name: Setup git and git-flow
+        if: steps.checks.outputs.should_finish == 'true'
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -139,6 +161,7 @@ jobs:
           git config gitflow.prefix.versiontag ""
 
       - name: Final branch-head safety check
+        if: steps.checks.outputs.should_finish == 'true'
         run: |
           set -euo pipefail
           MAIN_HEAD=$(gh pr view "${{ steps.prcheck.outputs.main_pr }}" --json headRefName --jq '.headRefName')
@@ -155,6 +178,7 @@ jobs:
           fi
 
       - name: Finish release
+        if: steps.checks.outputs.should_finish == 'true'
         run: |
           set -euo pipefail
           RELNUM="${{ steps.extract.outputs.release_number }}"
@@ -167,7 +191,7 @@ jobs:
           git push origin --delete "release/${RELNUM}" || true
 
       - name: Close related PRs
-        if: always()
+        if: always() && steps.checks.outputs.should_finish == 'true'
         run: |
           set -euo pipefail
           gh pr close "${{ steps.prcheck.outputs.main_pr }}" --comment "Auto-finish completed for ${HEAD_REF}." || true
