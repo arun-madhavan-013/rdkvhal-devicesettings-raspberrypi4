@@ -117,7 +117,7 @@ jobs:
           if git show-ref --verify --quiet "refs/heads/${RELEASE_BRANCH}" || \
              git ls-remote --exit-code --heads origin "${RELEASE_BRANCH}" > /dev/null 2>&1; then
             echo "ERROR: Release branch '${RELEASE_BRANCH}' already exists locally or on origin."
-            echo "If this is a retry after a transient failure, run phase=finish or delete the branch before re-publishing."
+            echo "If this is a retry after a transient failure, delete the branch before re-publishing."
             exit 1
           fi
 
