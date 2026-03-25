@@ -49,31 +49,31 @@ jobs:
       - name: Validate Release Number
         run: |
           if ! [[ $RELNUM =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "❌ Invalid release number: $RELNUM (expected X.Y.Z format)"
+            echo "Invalid release number: $RELNUM (expected X.Y.Z format)"
             exit 1
           fi
-          echo "✅ Release number valid: $RELNUM"
+          echo "Release number valid: $RELNUM"
 
       - name: Validate Ticket Prefix
         run: |
           TICKET_PREFIX="${TICKET%:}"
           if ! [[ $TICKET_PREFIX =~ ^[A-Z]+[A-Z0-9]*-[0-9]+$ ]]; then
-            echo "❌ Invalid ticket format: $TICKET_PREFIX"
+            echo "Invalid ticket format: $TICKET_PREFIX"
             echo "Expected format: PROJECT-123 or PROJ-999"
             exit 1
           fi
           TICKET_WITH_COLON="${TICKET_PREFIX}:"
-          echo "✅ Ticket validated: $TICKET_WITH_COLON"
+          echo "Ticket validated: $TICKET_WITH_COLON"
 
       - name: Check Tag Doesn't Exist
         id: tag-check
         run: |
           if git show-ref --verify --quiet "refs/tags/$RELNUM" || \
              git ls-remote --exit-code --heads origin "release/$RELNUM" >/dev/null 2>&1; then
-            echo "❌ Release branch/tag already exists for version $RELNUM"
+            echo "Release branch/tag already exists for version $RELNUM"
             exit 1
           fi
-          echo "✅ No existing release branch for version $RELNUM"
+          echo "No existing release branch for version $RELNUM"
 
       - name: Configure git-flow
         run: |
@@ -82,7 +82,7 @@ jobs:
       - name: Create Release Branch
         run: |
           git flow release start "$RELNUM"
-          echo "✅ Created release branch: release/$RELNUM"
+          echo "Created release branch: release/$RELNUM"
 
       - name: Generate CHANGELOG
         run: |
@@ -91,7 +91,7 @@ jobs:
           cat /tmp/new_changelog.md > CHANGELOG.md
           git add CHANGELOG.md
           git commit -m "chore: update CHANGELOG for release $RELNUM"
-          echo "✅ CHANGELOG updated and committed"
+          echo "CHANGELOG updated and committed"
 
       - name: Create PR to develop
         id: pr-develop
@@ -120,12 +120,12 @@ This PR was auto-created by the Release Tag workflow." \
               --jq ".[0].number" 2>/dev/null || echo "")
 
             if [ -z "$PR_NUM" ] || [ "$PR_NUM" == "null" ]; then
-              echo "❌ Could not create or find PR to develop"
+              echo "Could not create or find PR to develop"
               exit 1
             fi
-            echo "ℹ️ PR to develop already exists: #$PR_NUM"
+            echo "PR to develop already exists: #$PR_NUM"
           else
-            echo "✅ Created PR to develop: #$PR_NUM"
+            echo "Created PR to develop: #$PR_NUM"
           fi
           echo "pr_develop=$PR_NUM" >> $GITHUB_OUTPUT
 
@@ -163,12 +163,12 @@ This PR was auto-created by the Release Tag workflow.
               --jq ".[0].number" 2>/dev/null || echo "")
 
             if [ -z "$PR_NUM" ] || [ "$PR_NUM" == "null" ]; then
-              echo "❌ Could not create or find PR to main"
+              echo "Could not create or find PR to main"
               exit 1
             fi
-            echo "ℹ️ PR to main already exists: #$PR_NUM"
+            echo "PR to main already exists: #$PR_NUM"
           else
-            echo "✅ Created PR to main: #$PR_NUM"
+            echo "Created PR to main: #$PR_NUM"
           fi
           echo "pr_main=$PR_NUM" >> $GITHUB_OUTPUT
 
