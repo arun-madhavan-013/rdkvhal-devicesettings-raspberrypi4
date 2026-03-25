@@ -3,12 +3,12 @@ name: Release Tag
 on:
   workflow_dispatch:
     inputs:
-      tag:
-        description: Release version in X.Y.Z format
+      release_number:
+        description: "Release version in strict semantic format X.Y.Z (for example: 4.1.0)"
         required: true
         type: string
       ticket:
-        description: Ticket ID (for example RDK7RM-35)
+        description: "Required ticket prefix; ':' is auto-appended if missing (example: RDK7RM-35, RDKVREFPLT-5489:)"
         required: true
         type: string
 
@@ -18,57 +18,161 @@ permissions:
   checks: read
   statuses: read
 
+concurrency:
+  group: release-tag-global
+  cancel-in-progress: false
+
 jobs:
-  publish:
-    name: Create Release PRs
+  release:
+    name: Create Release Tag
     runs-on: ubuntu-latest
     env:
-      RELNUM: ${{ inputs.tag }}
+      RELNUM: ${{ inputs.release_number }}
       TICKET: ${{ inputs.ticket }}
       GH_TOKEN: ${{ github.token }}
+
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Setup Node and Tools
-        run: |
-          sudo apt-get update && sudo apt-get install -y git-flow
-          npm install -g auto-changelog
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
 
-      - name: Configure Git
+      - name: Install dependencies
         run: |
-          git config --global user.name "GitHub Actions"
-          git config --global user.email "actions@github.com"
+          sudo apt-get update
+          sudo apt-get install -y git-flow
+          if ! command -v gh >/dev/null 2>&1; then
+            sudo apt-get install -y gh
+          fi
+          npm install -g auto-changelog@2.5.0
 
-  validate-inputs:
-    name: Validate Manual Trigger
-    runs-on: ubuntu-latest
-    steps:
-      - name: Show Inputs
+      - name: Preflight diagnostics
         run: |
-          echo "Release Tag workflow was triggered manually"
-          echo "tag=${{ inputs.tag }}"
-          echo "ticket=${{ inputs.ticket }}"
+          set -euo pipefail
+          echo "release_number=${RELNUM}"
+          git --version
+          git flow version
+          gh --version | head -n 1
+          node --version
+          npm --version
+          auto-changelog --version
 
-      - name: Basic Validation
+      - name: Configure git identity
         run: |
-          if ! [[ "${{ inputs.tag }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Invalid tag format. Expected X.Y.Z"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Validate inputs and sync branches
+        run: |
+          set -euo pipefail
+
+          if ! [[ "${RELNUM}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release_number: '${RELNUM}'. Expected strict semantic version format X.Y.Z (for example: 4.1.0)."
             exit 1
           fi
 
-          if ! [[ "${{ inputs.ticket }}" =~ ^[A-Z]+[A-Z0-9]*-[0-9]+$ ]]; then
-            echo "Invalid ticket format. Expected PROJECT-123"
+          TICKET_PREFIX="$(echo "${TICKET}" | sed 's/[[:space:]]*$//')"
+          if [ -z "${TICKET_PREFIX}" ]; then
+            echo "Invalid ticket: value is empty after trimming trailing spaces."
             exit 1
           fi
 
-          echo "Inputs are valid"
-      - name: Check for Existing Tag
-        run: |
-          if git rev-parse "refs/tags/${{ inputs.tag }}" >/dev/null 2>&1; then
-            echo "Tag ${{ inputs.tag }} already exists. Please choose a different tag."
+          if ! [[ "${TICKET_PREFIX}" =~ :$ ]]; then
+            TICKET_PREFIX="${TICKET_PREFIX}:"
+            echo "Ticket suffix ':' was missing and has been appended automatically."
+          fi
+
+          echo "TICKET_PREFIX=${TICKET_PREFIX}" >> "${GITHUB_ENV}"
+
+          git fetch --tags origin
+          if git ls-remote --exit-code --tags origin "refs/tags/${RELNUM}" >/dev/null 2>&1; then
+            echo "Tag '${RELNUM}' already exists on origin. Choose a new release_number."
             exit 1
           fi
-          echo "Tag ${{ inputs.tag }} does not exist, proceeding with release process."
+
+          git checkout -B main origin/main
+          git checkout -B develop origin/develop
+
+      - name: Configure git-flow for main/develop
+        run: |
+          git config gitflow.branch.master main
+          git config gitflow.branch.develop develop
+          git config gitflow.prefix.feature feature/
+          git config gitflow.prefix.bugfix bugfix/
+          git config gitflow.prefix.release release/
+          git config gitflow.prefix.hotfix hotfix/
+          git config gitflow.prefix.support support/
+          git config gitflow.prefix.versiontag ""
+
+      - name: Publish release and open PRs
+        run: |
+          set -euo pipefail
+
+          RELEASE_BRANCH="release/${RELNUM}"
+          if git show-ref --verify --quiet "refs/heads/${RELEASE_BRANCH}" || \
+             git ls-remote --exit-code --heads origin "${RELEASE_BRANCH}" > /dev/null 2>&1; then
+            echo "ERROR: Release branch '${RELEASE_BRANCH}' already exists locally or on origin."
+            echo "If this is a retry after a transient failure, run phase=finish or delete the branch before re-publishing."
+            exit 1
+          fi
+
+          git flow release start "${RELNUM}"
+          auto-changelog -v "${RELNUM}"
+
+          git add CHANGELOG.md
+          if git diff --cached --quiet; then
+            echo "No changelog changes detected for ${RELNUM}. Aborting release workflow."
+            exit 1
+          fi
+          git commit -s -m "${TICKET_PREFIX} Changelog updates for ${RELNUM}"
+
+          git flow release publish "${RELNUM}"
+
+          if [ "$(gh pr list --base develop --head "${RELEASE_BRANCH}" --state open --json number --jq 'length')" -eq 0 ]; then
+            gh pr create --base develop --head "${RELEASE_BRANCH}" --title "Release ${RELNUM} -> develop" --body "Automated release PR for ${RELNUM}. Do not merge from UI."
+          fi
+
+          if [ "$(gh pr list --base main --head "${RELEASE_BRANCH}" --state open --json number --jq 'length')" -eq 0 ]; then
+            gh pr create --base main --head "${RELEASE_BRANCH}" --title "Release ${RELNUM} -> main" --body "Automated release PR for ${RELNUM}. Do not merge from UI."
+          fi
+
+          DEVELOP_PRS="$(gh pr list --base develop --head "${RELEASE_BRANCH}" --state open --json number,url --jq '[.[] | "- #\(.number): \(.url)"] | join("\n")')"
+          MAIN_PRS="$(gh pr list --base main --head "${RELEASE_BRANCH}" --state open --json number,url --jq '[.[] | "- #\(.number): \(.url)"] | join("\n")')"
+
+          echo "Publish phase completed for ${RELNUM}."
+          echo "1) Review/approve release PR(s) to develop and main."
+          echo "2) Ensure required checks are green."
+          echo "3) Auto-finish workflow will complete release after approvals/checks."
+          echo "Note: Do not merge release PRs manually from the UI."
+
+          {
+            echo "## Release ${RELNUM} - Step1 Completed"
+            echo ""
+            echo "Step1 (publish) has completed."
+            echo ""
+            echo "### Open PR(s) to develop"
+            if [ -n "${DEVELOP_PRS}" ]; then
+              echo "${DEVELOP_PRS}"
+            else
+              echo "- None"
+            fi
+            echo ""
+            echo "### Open PR(s) to main"
+            if [ -n "${MAIN_PRS}" ]; then
+              echo "${MAIN_PRS}"
+            else
+              echo "- None"
+            fi
+            echo ""
+            echo "### Required Next Action"
+            echo "1. Review and approve both release PRs."
+            echo "2. Wait for required checks to pass."
+            echo "3. Auto-finish workflow will complete the release."
+            echo ""
+            echo "Do not merge release PRs manually from the UI."
+          } >> "${GITHUB_STEP_SUMMARY}"
