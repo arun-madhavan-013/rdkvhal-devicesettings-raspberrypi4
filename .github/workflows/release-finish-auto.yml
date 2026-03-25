@@ -179,20 +179,60 @@ jobs:
           fi
 
       - name: Finish release
+        id: finish_release
         if: steps.checks.outputs.should_finish == 'true'
         run: |
           set -euo pipefail
           RELNUM="${{ steps.extract.outputs.release_number }}"
+          RELEASE_BRANCH="release/${RELNUM}"
 
-          git fetch origin "release/${RELNUM}"
-          git checkout -B "release/${RELNUM}" "origin/release/${RELNUM}"
+          # Idempotency guard: if tag already exists and release branch is gone, release is already finished.
+          TAG_EXISTS=false
+          BRANCH_EXISTS=false
+          if git ls-remote --exit-code --tags origin "refs/tags/${RELNUM}" >/dev/null 2>&1; then
+            TAG_EXISTS=true
+          fi
+          if git ls-remote --exit-code --heads origin "${RELEASE_BRANCH}" >/dev/null 2>&1; then
+            BRANCH_EXISTS=true
+          fi
 
-          git flow release finish -m "Merge release/${RELNUM}" "${RELNUM}"
+          if [ "${TAG_EXISTS}" = true ] && [ "${BRANCH_EXISTS}" = false ]; then
+            echo "::notice title=Already Finished::Tag ${RELNUM} exists and ${RELEASE_BRANCH} is absent; nothing to do."
+            echo "did_finish=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          FETCH_OUTPUT=$(git fetch origin "${RELEASE_BRANCH}" 2>&1) || true
+          if echo "${FETCH_OUTPUT}" | grep -q "couldn't find remote ref"; then
+            echo "::notice title=Already Finished::${RELEASE_BRANCH} no longer exists on origin."
+            echo "did_finish=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          if [ -n "${FETCH_OUTPUT}" ] && echo "${FETCH_OUTPUT}" | grep -qiE "fatal|error"; then
+            echo "Git fetch failed: ${FETCH_OUTPUT}"
+            exit 1
+          fi
+
+          git checkout -B "${RELEASE_BRANCH}" "origin/${RELEASE_BRANCH}"
+
+          FINISH_OUTPUT=$(git flow release finish -m "Merge ${RELEASE_BRANCH}" "${RELNUM}" 2>&1) || true
+          if echo "${FINISH_OUTPUT}" | grep -qiE "already exists|not found|does not exist|fatal"; then
+            # Treat common re-entrant/duplicate-event cases as non-fatal.
+            echo "::notice title=Finish Skipped::${FINISH_OUTPUT}"
+            echo "did_finish=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [ -n "${FINISH_OUTPUT}" ]; then
+            echo "${FINISH_OUTPUT}"
+          fi
+
           git push origin main develop --tags
-          git push origin --delete "release/${RELNUM}" || true
+          git push origin --delete "${RELEASE_BRANCH}" || true
+          echo "did_finish=true" >> "${GITHUB_OUTPUT}"
 
       - name: Close related PRs
-        if: always() && steps.checks.outputs.should_finish == 'true'
+        if: always() && steps.finish_release.outputs.did_finish == 'true'
         run: |
           set -euo pipefail
           gh pr close "${{ steps.prcheck.outputs.main_pr }}" --comment "Auto-finish completed for ${HEAD_REF}." || true
