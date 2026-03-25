@@ -33,12 +33,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: "20"
 
@@ -175,4 +175,11 @@ jobs:
             echo "3. Auto-finish workflow will complete the release."
             echo ""
             echo "Do not merge release PRs manually from the UI."
+            echo ""
+            echo "### Quick Link"
+            echo "- [Open Pull Requests tab](https://github.com/${{ github.repository }}/pulls)"
           } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Post-summary next-step hint
+        run: |
+          echo "::notice title=Next Step::Open https://github.com/${{ github.repository }}/pulls to review and approve release PRs."
