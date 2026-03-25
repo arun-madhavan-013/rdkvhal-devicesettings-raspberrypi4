@@ -1,12 +1,16 @@
 name: Release Finish Auto
 
 on:
+  # Triggers on PR review submitted (approval detection)
+  pull_request_review:
+    types:
+      - submitted
+  # Also triggers on PR open/update events for initial validation
   pull_request:
     types:
       - opened
       - synchronize
       - review_requested
-      - reviews
 
 permissions:
   contents: write
@@ -15,19 +19,19 @@ permissions:
   statuses: read
 
 concurrency:
-  group: release-${{ github.head_ref }}
+  group: release-${{ github.event.pull_request.head.ref || github.event.review.pull_request_url }}
   cancel-in-progress: false
 
 jobs:
   finish:
     name: Auto-Finish Release if Ready
     if: |
-      github.event.action != 'closed' &&
-      github.base_ref == 'main' &&
-      startsWith(github.head_ref, 'release/')
+      github.event.pull_request.state != 'closed' &&
+      github.event.pull_request.base.ref == 'main' &&
+      startsWith(github.event.pull_request.head.ref, 'release/')
     runs-on: ubuntu-latest
     env:
-      HEAD_REF: ${{ github.head_ref }}
+      HEAD_REF: ${{ github.event.pull_request.head.ref }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Extract Release Number
