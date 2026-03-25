@@ -1,0 +1,178 @@
+name: Auto Finish Approved Release
+
+on:
+  pull_request_review:
+    types:
+      - submitted
+  pull_request:
+    types:
+      - synchronize
+      - reopened
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  statuses: read
+
+concurrency:
+  group: release-${{ github.event.pull_request.head.ref }}
+  cancel-in-progress: false
+
+jobs:
+  finish:
+    name: Auto Finish Approved Release
+    if: |
+      github.event.pull_request.state == 'open' &&
+      github.event.pull_request.base.ref == 'main' &&
+      startsWith(github.event.pull_request.head.ref, 'release/')
+    runs-on: ubuntu-latest
+    env:
+      HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Extract release number
+        id: extract
+        run: |
+          set -euo pipefail
+          RELNUM="${HEAD_REF#release/}"
+          if ! [[ "${RELNUM}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release branch '${HEAD_REF}' (expected release/X.Y.Z)."
+            exit 1
+          fi
+          echo "release_number=${RELNUM}" >> "${GITHUB_OUTPUT}"
+
+      - name: Ensure exactly one related PR per base
+        id: prcheck
+        run: |
+          set -euo pipefail
+          DEVELOP_COUNT=$(gh pr list --base develop --head "${HEAD_REF}" --state open --json number --jq 'length')
+          MAIN_COUNT=$(gh pr list --base main --head "${HEAD_REF}" --state open --json number --jq 'length')
+
+          if [ "${DEVELOP_COUNT}" -ne 1 ]; then
+            echo "Expected exactly 1 open PR to develop for ${HEAD_REF}, found ${DEVELOP_COUNT}."
+            exit 1
+          fi
+
+          if [ "${MAIN_COUNT}" -ne 1 ]; then
+            echo "Expected exactly 1 open PR to main for ${HEAD_REF}, found ${MAIN_COUNT}."
+            exit 1
+          fi
+
+          DEVELOP_PR=$(gh pr list --base develop --head "${HEAD_REF}" --state open --json number --jq '.[0].number')
+          MAIN_PR=$(gh pr list --base main --head "${HEAD_REF}" --state open --json number --jq '.[0].number')
+
+          echo "develop_pr=${DEVELOP_PR}" >> "${GITHUB_OUTPUT}"
+          echo "main_pr=${MAIN_PR}" >> "${GITHUB_OUTPUT}"
+
+      - name: Ensure both PRs are approved
+        run: |
+          set -euo pipefail
+          MAIN_APPROVAL=$(gh pr view "${{ steps.prcheck.outputs.main_pr }}" --json reviewDecision --jq '.reviewDecision')
+          DEV_APPROVAL=$(gh pr view "${{ steps.prcheck.outputs.develop_pr }}" --json reviewDecision --jq '.reviewDecision')
+
+          if [ "${MAIN_APPROVAL}" != "APPROVED" ]; then
+            echo "Main PR #${{ steps.prcheck.outputs.main_pr }} is not approved (${MAIN_APPROVAL})."
+            exit 1
+          fi
+
+          if [ "${DEV_APPROVAL}" != "APPROVED" ]; then
+            echo "Develop PR #${{ steps.prcheck.outputs.develop_pr }} is not approved (${DEV_APPROVAL})."
+            exit 1
+          fi
+
+      - name: Ensure checks passed on both PRs
+        run: |
+          set -euo pipefail
+
+          check_pr() {
+            local pr_number="$1"
+            local total
+            local passing
+
+            total=$(gh pr checks "${pr_number}" --json conclusion --jq 'length')
+            if [ "${total}" -eq 0 ]; then
+              echo "PR #${pr_number} has zero checks; skipping strict check gate."
+              return 0
+            fi
+
+            passing=$(gh pr checks "${pr_number}" --json conclusion --jq '[.[] | select(.conclusion | IN("SUCCESS","NEUTRAL","SKIPPED","CANCELLED"))] | length')
+            if [ "${passing}" -ne "${total}" ]; then
+              echo "PR #${pr_number} has failing/pending checks."
+              gh pr checks "${pr_number}"
+              return 1
+            fi
+
+            return 0
+          }
+
+          check_pr "${{ steps.prcheck.outputs.main_pr }}"
+          check_pr "${{ steps.prcheck.outputs.develop_pr }}"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ env.GH_TOKEN }}
+
+      - name: Setup git and git-flow
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          sudo apt-get update
+          sudo apt-get install -y git-flow
+          git config gitflow.branch.master main
+          git config gitflow.branch.develop develop
+          git config gitflow.prefix.feature feature/
+          git config gitflow.prefix.bugfix bugfix/
+          git config gitflow.prefix.release release/
+          git config gitflow.prefix.hotfix hotfix/
+          git config gitflow.prefix.support support/
+          git config gitflow.prefix.versiontag ""
+
+      - name: Final branch-head safety check
+        run: |
+          set -euo pipefail
+          MAIN_HEAD=$(gh pr view "${{ steps.prcheck.outputs.main_pr }}" --json headRefName --jq '.headRefName')
+          DEV_HEAD=$(gh pr view "${{ steps.prcheck.outputs.develop_pr }}" --json headRefName --jq '.headRefName')
+
+          if [ "${MAIN_HEAD}" != "${HEAD_REF}" ]; then
+            echo "Main PR head mismatch: ${MAIN_HEAD} != ${HEAD_REF}"
+            exit 1
+          fi
+
+          if [ "${DEV_HEAD}" != "${HEAD_REF}" ]; then
+            echo "Develop PR head mismatch: ${DEV_HEAD} != ${HEAD_REF}"
+            exit 1
+          fi
+
+      - name: Finish release
+        run: |
+          set -euo pipefail
+          RELNUM="${{ steps.extract.outputs.release_number }}"
+
+          git fetch origin "release/${RELNUM}"
+          git checkout -B "release/${RELNUM}" "origin/release/${RELNUM}"
+
+          git flow release finish -m "Merge release/${RELNUM}" "${RELNUM}"
+          git push origin main develop --tags
+          git push origin --delete "release/${RELNUM}" || true
+
+      - name: Close related PRs
+        if: always()
+        run: |
+          set -euo pipefail
+          gh pr close "${{ steps.prcheck.outputs.main_pr }}" --comment "Auto-finish completed for ${HEAD_REF}." || true
+          gh pr close "${{ steps.prcheck.outputs.develop_pr }}" --comment "Auto-finish completed for ${HEAD_REF}." || true
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Release ${{ steps.extract.outputs.release_number }} auto-finish"
+            echo ""
+            echo "- Branch: ${HEAD_REF}"
+            echo "- Main PR: #${{ steps.prcheck.outputs.main_pr }}"
+            echo "- Develop PR: #${{ steps.prcheck.outputs.develop_pr }}"
+          } >> "${GITHUB_STEP_SUMMARY}"
