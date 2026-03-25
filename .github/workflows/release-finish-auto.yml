@@ -37,6 +37,7 @@ jobs:
     env:
       HEAD_REF: ${{ github.event.pull_request.head.ref }}
       GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
       - name: Extract release number
         id: extract
