@@ -1,5 +1,5 @@
 name: Release Tag
-# Manual trigger: go to Actions → Release Tag → Run workflow
+# Manual trigger: go to Actions > Release Tag > Run workflow
 on:
   workflow_dispatch:
     inputs:
