@@ -14,6 +14,9 @@ on:
     branches:
       - develop
       - main
+  check_suite:
+    types:
+      - completed
 
 permissions:
   contents: write
@@ -22,20 +25,30 @@ permissions:
   statuses: read
 
 concurrency:
-  group: release-${{ github.event.pull_request.head.ref }}
+  group: release-${{ github.event_name == 'check_suite' && github.event.check_suite.pull_requests[0].head.ref || github.event.pull_request.head.ref || github.run_id }}
   cancel-in-progress: false
 
 jobs:
   finish:
     name: Auto Finish Approved Release
     if: |
-      github.event.pull_request.state == 'open' &&
-      (github.event.pull_request.base.ref == 'main' || github.event.pull_request.base.ref == 'develop') &&
-      startsWith(github.event.pull_request.head.ref, 'release/') &&
-      (github.event_name != 'pull_request_review' || github.event.review.state == 'approved')
+      (
+        (github.event_name == 'pull_request' || github.event_name == 'pull_request_review') &&
+        github.event.pull_request.state == 'open' &&
+        (github.event.pull_request.base.ref == 'main' || github.event.pull_request.base.ref == 'develop') &&
+        startsWith(github.event.pull_request.head.ref, 'release/') &&
+        (github.event_name != 'pull_request_review' || github.event.review.state == 'approved')
+      ) || (
+        github.event_name == 'check_suite' &&
+        github.event.check_suite.conclusion == 'success' &&
+        github.event.check_suite.pull_requests[0] != null &&
+        github.event.check_suite.pull_requests[0].state == 'open' &&
+        (github.event.check_suite.pull_requests[0].base.ref == 'main' || github.event.check_suite.pull_requests[0].base.ref == 'develop') &&
+        startsWith(github.event.check_suite.pull_requests[0].head.ref, 'release/')
+      )
     runs-on: ubuntu-latest
     env:
-      HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      HEAD_REF: ${{ github.event_name == 'check_suite' && github.event.check_suite.pull_requests[0].head.ref || github.event.pull_request.head.ref }}
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:

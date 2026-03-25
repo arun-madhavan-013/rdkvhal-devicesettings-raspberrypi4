@@ -1,4 +1,4 @@
-name: Release Tag
+name: Release Publish and Open PRs
 
 on:
   workflow_dispatch:
@@ -24,7 +24,7 @@ concurrency:
 
 jobs:
   release:
-    name: Create Release Tag
+    name: Publish Release Branch and Open PRs
     runs-on: ubuntu-latest
     env:
       RELNUM: ${{ inputs.release_number }}
@@ -71,12 +71,24 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Strip CR/LF from all user-provided inputs before any validation/use.
+          RELNUM_SANITIZED="${RELNUM//$'\r'/}"
+          RELNUM_SANITIZED="${RELNUM_SANITIZED//$'\n'/}"
+          TICKET_SANITIZED="${TICKET//$'\r'/}"
+          TICKET_SANITIZED="${TICKET_SANITIZED//$'\n'/}"
+
+          if [ "${RELNUM_SANITIZED}" != "${RELNUM}" ] || [ "${TICKET_SANITIZED}" != "${TICKET}" ]; then
+            echo "Input normalization: stripped CR/LF characters from workflow inputs."
+          fi
+
+          RELNUM="${RELNUM_SANITIZED}"
+
           if ! [[ "${RELNUM}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "Invalid release_number: '${RELNUM}'. Expected strict semantic version format X.Y.Z (for example: 4.1.0)."
             exit 1
           fi
 
-          TICKET_PREFIX="$(echo "${TICKET}" | sed 's/[[:space:]]*$//')"
+          TICKET_PREFIX="$(echo "${TICKET_SANITIZED}" | sed 's/[[:space:]]*$//')"
           if [ -z "${TICKET_PREFIX}" ]; then
             echo "Invalid ticket: value is empty after trimming trailing spaces."
             exit 1
@@ -87,6 +99,7 @@ jobs:
             echo "Ticket suffix ':' was missing and has been appended automatically."
           fi
 
+          echo "RELNUM=${RELNUM}" >> "${GITHUB_ENV}"
           echo "TICKET_PREFIX=${TICKET_PREFIX}" >> "${GITHUB_ENV}"
 
           git fetch --tags origin
